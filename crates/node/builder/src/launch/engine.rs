@@ -124,7 +124,12 @@ impl EngineNodeLauncher {
             })
             .with_genesis()?
             .inspect(|this: &LaunchContextWith<Attached<WithConfigs<<T::Types as NodeTypes>::ChainSpec>, _>>| {
-                info!(target: "reth::cli", "\n{}", this.chain_spec().display_hardforks());
+                let chain_spec = this.chain_spec();
+                info!(target: "reth::cli", "\n{}", chain_spec.display_hardforks());
+                // Log base fee multipliers if configured
+                if let Some(multipliers_info) = chain_spec.base_fee_multipliers_info() {
+                    info!(target: "reth::cli", "{}", multipliers_info);
+                }
             })
             .with_metrics_task()
             // passing FullNodeTypes as type parameter here so that we can build

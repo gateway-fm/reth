@@ -10,7 +10,7 @@ use crate::{
     sepolia::SEPOLIA_PARIS_BLOCK,
     EthChainSpec,
 };
-use alloc::{boxed::Box, format, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeMap, format, sync::Arc, vec::Vec};
 use alloy_chains::{Chain, NamedChain};
 use alloy_consensus::{
     constants::{
@@ -117,6 +117,7 @@ pub static MAINNET: LazyLock<Arc<ChainSpec>> = LazyLock::new(|| {
             (mainnet::MAINNET_BPO1_TIMESTAMP, BlobParams::bpo1()),
             (mainnet::MAINNET_BPO2_TIMESTAMP, BlobParams::bpo2()),
         ]),
+        base_fee_change_multipliers: BTreeMap::new(),
     };
     spec.genesis.config.dao_fork_support = true;
     spec.into()
@@ -152,6 +153,7 @@ pub static SEPOLIA: LazyLock<Arc<ChainSpec>> = LazyLock::new(|| {
             (sepolia::SEPOLIA_BPO1_TIMESTAMP, BlobParams::bpo1()),
             (sepolia::SEPOLIA_BPO2_TIMESTAMP, BlobParams::bpo2()),
         ]),
+        base_fee_change_multipliers: BTreeMap::new(),
     };
     spec.genesis.config.dao_fork_support = true;
     spec.into()
@@ -182,6 +184,7 @@ pub static HOLESKY: LazyLock<Arc<ChainSpec>> = LazyLock::new(|| {
             (holesky::HOLESKY_BPO1_TIMESTAMP, BlobParams::bpo1()),
             (holesky::HOLESKY_BPO2_TIMESTAMP, BlobParams::bpo2()),
         ]),
+        base_fee_change_multipliers: BTreeMap::new(),
     };
     spec.genesis.config.dao_fork_support = true;
     spec.into()
@@ -214,6 +217,7 @@ pub static HOODI: LazyLock<Arc<ChainSpec>> = LazyLock::new(|| {
             (hoodi::HOODI_BPO1_TIMESTAMP, BlobParams::bpo1()),
             (hoodi::HOODI_BPO2_TIMESTAMP, BlobParams::bpo2()),
         ]),
+        base_fee_change_multipliers: BTreeMap::new(),
     };
     spec.genesis.config.dao_fork_support = true;
     spec.into()
@@ -289,7 +293,7 @@ impl<H: BlockHeader> core::ops::Deref for ChainSpec<H> {
 /// - Meta-information about the chain (the chain ID)
 /// - The genesis block of the chain ([`Genesis`])
 /// - What hardforks are activated, and under which conditions
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChainSpec<H: BlockHeader = Header> {
     /// The chain ID
     pub chain: Chain,
@@ -318,6 +322,14 @@ pub struct ChainSpec<H: BlockHeader = Header> {
 
     /// The settings passed for blob configurations for specific hardforks.
     pub blob_params: BlobScheduleBlobParams,
+
+    /// Base fee change multipliers by block number.
+    /// When calculating the next block's base fee, the delta is multiplied by the
+    /// multiplier active at that block number. If no multiplier is specified for a block,
+    /// the default multiplier of 1.0 is used.
+    /// The map is keyed by block number, and the multiplier for a given block is the
+    /// multiplier associated with the highest block number <= the current block.
+    pub base_fee_change_multipliers: BTreeMap<u64, f64>,
 }
 
 impl<H: BlockHeader> Default for ChainSpec<H> {
@@ -332,6 +344,7 @@ impl<H: BlockHeader> Default for ChainSpec<H> {
             base_fee_params: BaseFeeParamsKind::Constant(BaseFeeParams::ethereum()),
             prune_delete_limit: MAINNET_PRUNE_DELETE_LIMIT,
             blob_params: Default::default(),
+            base_fee_change_multipliers: BTreeMap::new(),
         }
     }
 }
@@ -416,6 +429,30 @@ impl<H: BlockHeader> ChainSpec<H> {
                 bf_params.first().map(|(_, params)| *params).unwrap_or(BaseFeeParams::ethereum())
             }
         }
+    }
+
+    /// Get the base fee change multiplier for the given block number.
+    /// Returns the multiplier associated with the highest block number <= the given block,
+    /// or 1.0 if no multiplier is configured.
+    pub fn base_fee_change_multiplier_at_block(&self, block_number: u64) -> f64 {
+        self.base_fee_change_multipliers
+            .range(..=block_number)
+            .next_back()
+            .map(|(_, multiplier)| *multiplier)
+            .unwrap_or(1.0)
+    }
+
+    /// Returns a simple string representation of base fee change multipliers for logging.
+    pub fn display_base_fee_multipliers(&self) -> String {
+        if self.base_fee_change_multipliers.is_empty() {
+            return String::new();
+        }
+
+        let mut parts = vec![format!("Base fee multipliers: {} configured", self.base_fee_change_multipliers.len())];
+        for (block, multiplier) in &self.base_fee_change_multipliers {
+            parts.push(format!("  Block {}: {}", block, multiplier));
+        }
+        parts.join("\n")
     }
 
     /// Get the hash of the genesis block.
@@ -677,6 +714,7 @@ impl<H: BlockHeader> ChainSpec<H> {
             base_fee_params,
             prune_delete_limit,
             blob_params,
+            base_fee_change_multipliers,
         } = self;
         ChainSpec {
             chain,
@@ -688,6 +726,7 @@ impl<H: BlockHeader> ChainSpec<H> {
             base_fee_params,
             prune_delete_limit,
             blob_params,
+            base_fee_change_multipliers,
         }
     }
 }
@@ -813,6 +852,34 @@ impl From<Genesis> for ChainSpec {
 
         let hardforks = ChainHardforks::new(ordered_hardforks);
 
+        let base_fee_change_multipliers = genesis
+            .config
+            .extra_fields
+            .get("baseFeeChangeMultipliers")
+            .and_then(|value| {
+                value.as_object().map(|obj| {
+                    let mut multipliers = BTreeMap::new();
+                    for (block_str, multiplier_value) in obj {
+                        if let (Ok(block), Some(multiplier)) = (
+                            block_str.parse::<u64>(),
+                            multiplier_value.as_f64(),
+                        ) {
+                            multipliers.insert(block, multiplier);
+                        }
+                    }
+                    multipliers
+                })
+            })
+            .unwrap_or_default();
+
+        // Always log if multipliers were parsed (using eprintln so it's always visible)
+        if !base_fee_change_multipliers.is_empty() {
+            eprintln!("[reth] ✓ Loaded {} base fee multiplier(s) from genesis config:", base_fee_change_multipliers.len());
+            for (block, multiplier) in &base_fee_change_multipliers {
+                eprintln!("[reth]   Block {}: multiplier {}", block, multiplier);
+            }
+        }
+
         Self {
             chain: genesis.config.chain_id.into(),
             genesis_header: SealedHeader::new_unhashed(make_genesis_header(&genesis, &hardforks)),
@@ -821,6 +888,7 @@ impl From<Genesis> for ChainSpec {
             paris_block_and_final_difficulty,
             deposit_contract,
             blob_params,
+            base_fee_change_multipliers,
             ..Default::default()
         }
     }
@@ -2803,5 +2871,340 @@ Post-merge hard forks (timestamp based):
                 fork_block: None,
             }
         )
+    }
+
+    #[test]
+    fn test_base_fee_change_multiplier_default() {
+        use crate::{ChainSpec, EthChainSpec};
+        use alloy_consensus::Header;
+        use alloy_eips::eip1559::INITIAL_BASE_FEE;
+
+        // Create a chain spec without multipliers (default should be 1.0)
+        let spec = ChainSpec::default();
+
+        let parent = Header {
+            number: 100,
+            gas_used: 15_000_000,
+            gas_limit: 30_000_000,
+            base_fee_per_gas: Some(INITIAL_BASE_FEE),
+            timestamp: 1_000,
+            ..Default::default()
+        };
+
+        // Calculate base fee without multiplier (should use default 1.0)
+        let base_fee_without_multiplier = parent
+            .next_block_base_fee(spec.base_fee_params_at_timestamp(parent.timestamp + 12))
+            .unwrap_or_default();
+
+        // Calculate using next_block_base_fee (should apply default multiplier of 1.0)
+        let base_fee_with_multiplier = spec
+            .next_block_base_fee(&parent, parent.timestamp + 12)
+            .unwrap_or_default();
+
+        // Should be the same since multiplier is 1.0
+        assert_eq!(base_fee_without_multiplier, base_fee_with_multiplier);
+    }
+
+    #[test]
+    fn test_base_fee_change_multiplier_single() {
+        use crate::{ChainSpec, EthChainSpec};
+        use alloy_consensus::{BlockHeader, Header};
+        use alloy_eips::eip1559::INITIAL_BASE_FEE;
+
+        // Create a chain spec with a multiplier
+        let mut spec = ChainSpec::default();
+        spec.base_fee_change_multipliers.insert(100, 0.01);
+
+        let parent = Header {
+            number: 99, // Block 99, next block will be 100
+            gas_used: 20_000_000, // Use more gas than target to create a delta
+            gas_limit: 30_000_000,
+            base_fee_per_gas: Some(INITIAL_BASE_FEE),
+            timestamp: 1_000,
+            ..Default::default()
+        };
+
+        // Calculate base fee without multiplier
+        let base_fee_without_multiplier = parent
+            .next_block_base_fee(spec.base_fee_params_at_timestamp(parent.timestamp + 12))
+            .unwrap_or_default();
+
+        // Calculate using next_block_base_fee (should apply multiplier 0.01 to delta)
+        let base_fee_with_multiplier = spec
+            .next_block_base_fee(&parent, parent.timestamp + 12)
+            .unwrap_or_default();
+
+        // Multiplier applies to delta, not the final base fee
+        // Calculate expected: delta = |base_fee_without_multiplier - parent_base_fee|
+        // adjusted_delta = delta * 0.01
+        // expected = parent_base_fee ± adjusted_delta
+        let parent_base_fee = parent.base_fee_per_gas().unwrap();
+        let delta = if base_fee_without_multiplier > parent_base_fee {
+            base_fee_without_multiplier - parent_base_fee
+        } else {
+            parent_base_fee - base_fee_without_multiplier
+        };
+        let adjusted_delta = (delta as f64 * 0.01).round() as u64;
+        let expected = if base_fee_without_multiplier > parent_base_fee {
+            parent_base_fee.saturating_add(adjusted_delta.max(1))
+        } else {
+            parent_base_fee.saturating_sub(adjusted_delta)
+        };
+
+        assert_eq!(base_fee_with_multiplier, expected);
+        // When multiplier < 1.0 and base fee increases, the adjusted base fee should be less than standard
+        if base_fee_without_multiplier > parent_base_fee {
+            assert!(base_fee_with_multiplier < base_fee_without_multiplier);
+            assert!(base_fee_with_multiplier > parent_base_fee); // But still greater than parent
+        }
+    }
+
+    #[test]
+    fn test_base_fee_change_multiplier_multiple_blocks() {
+        use crate::{ChainSpec, EthChainSpec};
+        use alloy_consensus::{BlockHeader, Header};
+        use alloy_eips::eip1559::INITIAL_BASE_FEE;
+
+        // Create a chain spec with multiple multipliers
+        let mut spec = ChainSpec::default();
+        spec.base_fee_change_multipliers.insert(100, 0.01);
+        spec.base_fee_change_multipliers.insert(200, 1.0);
+
+        // Test block 99 -> 100 (should use multiplier 0.01)
+        let parent_99 = Header {
+            number: 99,
+            gas_used: 15_000_000,
+            gas_limit: 30_000_000,
+            base_fee_per_gas: Some(INITIAL_BASE_FEE),
+            timestamp: 1_000,
+            ..Default::default()
+        };
+
+        let base_fee_100 = spec
+            .next_block_base_fee(&parent_99, parent_99.timestamp + 12)
+            .unwrap_or_default();
+
+        let base_fee_100_standard = parent_99
+            .next_block_base_fee(spec.base_fee_params_at_timestamp(parent_99.timestamp + 12))
+            .unwrap_or_default();
+        // Multiplier applies to delta
+        let parent_base_fee_99 = parent_99.base_fee_per_gas().unwrap();
+        let delta = if base_fee_100_standard > parent_base_fee_99 {
+            base_fee_100_standard - parent_base_fee_99
+        } else {
+            parent_base_fee_99 - base_fee_100_standard
+        };
+        let adjusted_delta = (delta as f64 * 0.01).round() as u64;
+        let base_fee_100_expected = if base_fee_100_standard > parent_base_fee_99 {
+            parent_base_fee_99.saturating_add(adjusted_delta.max(1))
+        } else {
+            parent_base_fee_99.saturating_sub(adjusted_delta)
+        };
+        assert_eq!(base_fee_100, base_fee_100_expected);
+
+        // Test block 149 -> 150 (should still use multiplier 0.01 from block 100)
+        let parent_149 = Header {
+            number: 149,
+            gas_used: 15_000_000,
+            gas_limit: 30_000_000,
+            base_fee_per_gas: Some(base_fee_100),
+            timestamp: 1_000 + 12 * 50,
+            ..Default::default()
+        };
+
+        let base_fee_150 = spec
+            .next_block_base_fee(&parent_149, parent_149.timestamp + 12)
+            .unwrap_or_default();
+
+        let base_fee_150_standard = parent_149
+            .next_block_base_fee(spec.base_fee_params_at_timestamp(parent_149.timestamp + 12))
+            .unwrap_or_default();
+        // Multiplier applies to delta
+        let parent_base_fee_149 = parent_149.base_fee_per_gas().unwrap();
+        let delta = if base_fee_150_standard > parent_base_fee_149 {
+            base_fee_150_standard - parent_base_fee_149
+        } else {
+            parent_base_fee_149 - base_fee_150_standard
+        };
+        let adjusted_delta = (delta as f64 * 0.01).round() as u64;
+        let base_fee_150_expected = if base_fee_150_standard > parent_base_fee_149 {
+            parent_base_fee_149.saturating_add(adjusted_delta.max(1))
+        } else {
+            parent_base_fee_149.saturating_sub(adjusted_delta)
+        };
+        assert_eq!(base_fee_150, base_fee_150_expected);
+
+        // Test block 199 -> 200 (should use multiplier 1.0 from block 200, since block 200 has its own multiplier)
+        let parent_199 = Header {
+            number: 199,
+            gas_used: 15_000_000,
+            gas_limit: 30_000_000,
+            base_fee_per_gas: Some(base_fee_100),
+            timestamp: 1_000 + 12 * 100,
+            ..Default::default()
+        };
+
+        let base_fee_200 = spec
+            .next_block_base_fee(&parent_199, parent_199.timestamp + 12)
+            .unwrap_or_default();
+
+        let base_fee_200_expected = parent_199
+            .next_block_base_fee(spec.base_fee_params_at_timestamp(parent_199.timestamp + 12))
+            .unwrap_or_default();
+        // At block 200, multiplier is 1.0, so should be the same as without multiplier
+        assert_eq!(base_fee_200, base_fee_200_expected);
+
+        // Test block 200 -> 201 (should use multiplier 1.0 from block 200)
+        let parent_200 = Header {
+            number: 200,
+            gas_used: 15_000_000,
+            gas_limit: 30_000_000,
+            base_fee_per_gas: Some(base_fee_200),
+            timestamp: parent_199.timestamp + 12,
+            ..Default::default()
+        };
+
+        let base_fee_201 = spec
+            .next_block_base_fee(&parent_200, parent_200.timestamp + 12)
+            .unwrap_or_default();
+
+        let base_fee_201_expected = parent_200
+            .next_block_base_fee(spec.base_fee_params_at_timestamp(parent_200.timestamp + 12))
+            .unwrap_or_default();
+        // Should be the same since multiplier is 1.0
+        assert_eq!(base_fee_201, base_fee_201_expected);
+    }
+
+    #[test]
+    fn test_base_fee_change_multiplier_from_genesis() {
+        use crate::ChainSpec;
+        use alloy_consensus::{BlockHeader, Header};
+        use alloy_eips::eip1559::INITIAL_BASE_FEE;
+
+        // Create a genesis JSON with baseFeeChangeMultipliers
+        let genesis_json = r#"{
+            "config": {
+                "chainId": 12345,
+                "londonBlock": 0,
+                "baseFeeChangeMultipliers": {
+                    "100": 0.01,
+                    "200": 1.0
+                }
+            },
+            "timestamp": "0x0",
+            "gasLimit": "0x1c9c380",
+            "difficulty": "0x0",
+            "extraData": "0x",
+            "gasUsed": "0x0",
+            "baseFeePerGas": "0x3b9aca00"
+        }"#;
+
+        let genesis: Genesis = serde_json::from_str(genesis_json).unwrap();
+        let spec = ChainSpec::from_genesis(genesis);
+
+        // Verify multipliers were parsed correctly
+        assert_eq!(spec.base_fee_change_multiplier_at_block(99), 1.0); // Before first multiplier
+        assert_eq!(spec.base_fee_change_multiplier_at_block(100), 0.01);
+        assert_eq!(spec.base_fee_change_multiplier_at_block(150), 0.01); // Between multipliers
+        assert_eq!(spec.base_fee_change_multiplier_at_block(200), 1.0);
+        assert_eq!(spec.base_fee_change_multiplier_at_block(300), 1.0); // After last multiplier
+
+        // Test that multiplier is actually applied
+        let parent = Header {
+            number: 99,
+            gas_used: 15_000_000,
+            gas_limit: 30_000_000,
+            base_fee_per_gas: Some(INITIAL_BASE_FEE),
+            timestamp: 1_000,
+            ..Default::default()
+        };
+
+        let base_fee = spec
+            .next_block_base_fee(&parent, parent.timestamp + 12)
+            .unwrap_or_default();
+
+        // Multiplier applies to delta, not the final base fee
+        let standard_base_fee = parent
+            .next_block_base_fee(spec.base_fee_params_at_timestamp(parent.timestamp + 12))
+            .unwrap_or_default();
+        let parent_base_fee = parent.base_fee_per_gas().unwrap();
+        let delta = if standard_base_fee > parent_base_fee {
+            standard_base_fee - parent_base_fee
+        } else {
+            parent_base_fee - standard_base_fee
+        };
+        let adjusted_delta = (delta as f64 * 0.01).round() as u64;
+        let expected_base_fee = if standard_base_fee > parent_base_fee {
+            parent_base_fee.saturating_add(adjusted_delta.max(1))
+        } else {
+            parent_base_fee.saturating_sub(adjusted_delta)
+        };
+        assert_eq!(base_fee, expected_base_fee);
+    }
+
+    #[test]
+    fn test_base_fee_change_multiplier_at_block() {
+        use crate::ChainSpec;
+        use alloy_consensus::Header;
+
+        let mut spec: ChainSpec<Header> = ChainSpec::default();
+        spec.base_fee_change_multipliers.insert(100, 0.5);
+        spec.base_fee_change_multipliers.insert(200, 2.0);
+        spec.base_fee_change_multipliers.insert(300, 0.1);
+
+        // Test before any multiplier
+        assert_eq!(spec.base_fee_change_multiplier_at_block(0), 1.0);
+        assert_eq!(spec.base_fee_change_multiplier_at_block(99), 1.0);
+
+        // Test at exact block boundaries
+        assert_eq!(spec.base_fee_change_multiplier_at_block(100), 0.5);
+        assert_eq!(spec.base_fee_change_multiplier_at_block(200), 2.0);
+        assert_eq!(spec.base_fee_change_multiplier_at_block(300), 0.1);
+
+        // Test between multipliers (should use the previous one)
+        assert_eq!(spec.base_fee_change_multiplier_at_block(150), 0.5);
+        assert_eq!(spec.base_fee_change_multiplier_at_block(250), 2.0);
+        assert_eq!(spec.base_fee_change_multiplier_at_block(350), 0.1);
+    }
+
+    #[test]
+    fn test_base_fee_change_multiplier_rounding() {
+        use crate::{ChainSpec, EthChainSpec};
+        use alloy_consensus::{BlockHeader, Header};
+        use alloy_eips::eip1559::INITIAL_BASE_FEE;
+
+        let mut spec = ChainSpec::default();
+        spec.base_fee_change_multipliers.insert(100, 0.333); // 1/3 multiplier
+
+        let parent = Header {
+            number: 99,
+            gas_used: 15_000_000,
+            gas_limit: 30_000_000,
+            base_fee_per_gas: Some(INITIAL_BASE_FEE),
+            timestamp: 1_000,
+            ..Default::default()
+        };
+
+        let base_fee = spec
+            .next_block_base_fee(&parent, parent.timestamp + 12)
+            .unwrap_or_default();
+
+        // Verify it's rounded correctly - multiplier applies to delta
+        let base_fee_without_multiplier = parent
+            .next_block_base_fee(spec.base_fee_params_at_timestamp(parent.timestamp + 12))
+            .unwrap_or_default();
+        let parent_base_fee = parent.base_fee_per_gas().unwrap();
+        let delta = if base_fee_without_multiplier > parent_base_fee {
+            base_fee_without_multiplier - parent_base_fee
+        } else {
+            parent_base_fee - base_fee_without_multiplier
+        };
+        let adjusted_delta = (delta as f64 * 0.333).round() as u64;
+        let expected = if base_fee_without_multiplier > parent_base_fee {
+            parent_base_fee.saturating_add(adjusted_delta.max(1))
+        } else {
+            parent_base_fee.saturating_sub(adjusted_delta)
+        };
+        assert_eq!(base_fee, expected);
     }
 }

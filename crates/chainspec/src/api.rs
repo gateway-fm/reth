@@ -63,6 +63,18 @@ pub trait EthChainSpec: Send + Sync + Unpin + Debug {
     /// Returns the final total difficulty if the Paris hardfork is known.
     fn final_paris_total_difficulty(&self) -> Option<U256>;
 
+    /// Returns a simple string representation of base fee change multipliers for logging.
+    /// Returns None if no multipliers are configured.
+    fn base_fee_multipliers_info(&self) -> Option<String> {
+        None
+    }
+
+    /// Get the base fee change multiplier for the given block number.
+    /// Returns 1.0 if no multiplier is configured for that block.
+    fn base_fee_multiplier_at_block(&self, _block_number: u64) -> f64 {
+        1.0
+    }
+
     /// See [`calc_next_block_base_fee`].
     fn next_block_base_fee(&self, parent: &Self::Header, target_timestamp: u64) -> Option<u64> {
         Some(calc_next_block_base_fee(
@@ -133,5 +145,93 @@ impl<H: BlockHeader> EthChainSpec for ChainSpec<H> {
 
     fn final_paris_total_difficulty(&self) -> Option<U256> {
         self.paris_block_and_final_difficulty.map(|(_, final_difficulty)| final_difficulty)
+    }
+
+    fn base_fee_multipliers_info(&self) -> Option<String> {
+        if self.base_fee_change_multipliers.is_empty() {
+            None
+        } else {
+            Some(self.display_base_fee_multipliers())
+        }
+    }
+
+    fn base_fee_multiplier_at_block(&self, block_number: u64) -> f64 {
+        self.base_fee_change_multiplier_at_block(block_number)
+    }
+
+    fn next_block_base_fee(&self, parent: &Self::Header, target_timestamp: u64) -> Option<u64> {
+        let parent_base_fee = parent.base_fee_per_gas()?;
+        let parent_gas_used = parent.gas_used();
+        let parent_gas_limit = parent.gas_limit();
+        let base_fee_params = self.base_fee_params_at_timestamp(target_timestamp);
+
+        // Get multiplier for the next block
+        let next_block_number = parent.number() + 1;
+        let multiplier = self.base_fee_change_multiplier_at_block(next_block_number);
+
+        // If multiplier is 1.0, use standard calculation
+        if multiplier == 1.0 {
+            return Some(calc_next_block_base_fee(
+                parent_gas_used,
+                parent_gas_limit,
+                parent_base_fee,
+                base_fee_params,
+            ));
+        }
+
+        // Calculate base fee with multiplier applied to delta (as per Go reference)
+        // This matches the logic from CalcBaseFee in the Go reference:
+        // 1. Calculate standard base fee using EIP-1559 formula
+        // 2. Calculate delta = |standard_base_fee - parent_base_fee|
+        // 3. Apply multiplier to delta
+        // 4. Apply adjusted delta to parent_base_fee (add if increased, subtract if decreased)
+
+        // Calculate standard base fee first
+        let standard_base_fee = calc_next_block_base_fee(
+            parent_gas_used,
+            parent_gas_limit,
+            parent_base_fee,
+            base_fee_params,
+        );
+
+        // Calculate delta (change in base fee)
+        let base_fee_delta = if standard_base_fee > parent_base_fee {
+            standard_base_fee - parent_base_fee
+        } else if parent_base_fee > standard_base_fee {
+            parent_base_fee - standard_base_fee
+        } else {
+            // No change, return parent base fee
+            return Some(parent_base_fee);
+        };
+
+        // Apply multiplier to delta (as per Go reference: applyBaseFeeMultiplier)
+        // Use pure integer arithmetic like Go's big.Int - no floating point operations
+        // Scale multiplier to 10^18 (like Solidity wei) for maximum precision
+        // This matches Go's big.Int precision exactly
+        const PRECISION: u128 = 1_000_000_000_000_000_000; // 10^18
+
+        // Convert f64 multiplier to fixed-point integer representation
+        // Use truncation (not rounding) to match Go's big.Int behavior exactly
+        // Go's big.Int uses integer division which truncates, not rounds
+        let multiplier_scaled = (multiplier * PRECISION as f64) as u128;
+
+        // Perform multiplication in u128 (like big.Int.Mul)
+        let product = base_fee_delta as u128 * multiplier_scaled;
+
+        // Use simple integer division (truncation) like Go's big.Int.Div
+        // Go's big.Int.Div truncates towards zero, which is what integer division does
+        let adjusted_delta = (product / PRECISION) as u64;
+
+        // Apply adjusted delta to parent base fee
+        let adjusted_base_fee = if standard_base_fee > parent_base_fee {
+            // Base fee increased: enforce minimum delta of 1 when increasing (as per Go: enforceMinOne=true)
+            parent_base_fee.saturating_add(adjusted_delta.max(1))
+        } else {
+            // Base fee decreased: no minimum delta enforcement (as per Go: enforceMinOne=false)
+            // Ensure we don't go below 0
+            parent_base_fee.saturating_sub(adjusted_delta)
+        };
+
+        Some(adjusted_base_fee)
     }
 }
